@@ -1,0 +1,1 @@
+So this is a very rough draft of code designed to run on an esp32 to control a watch cleaning machine see this YouTube video https://youtu.be/Opr75n8DbYY I'll be adding to this and making it easier for people to use. Please feel free to pitch in 
