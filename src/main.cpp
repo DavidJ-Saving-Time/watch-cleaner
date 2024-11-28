@@ -255,8 +255,7 @@ void displayTask(void *parameter) {
             }
             vTaskDelay(50 / portTICK_PERIOD_MS);
         } else if (eStop) {
-          display.clearDisplay();
-
+                display.clearDisplay();
                 display.setTextSize(1);
                 display.setTextColor(SSD1306_WHITE);
                 display.setCursor(0, 10);
