@@ -2,59 +2,65 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <Bounce2.h>
 #include <TMCStepper.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include </home/david/platform-io/PlaywriteGBS_VariableFont_wght9pt7b.h>
 #include <cmath>
-
-#include "esp_system.h"
+#include <vector>
+//#include "esp_system.h"//
 #include "freertos/FreeRTOS.h"
+#include <Preferences.h>
 
-// Function declarations for multitaskingmotorTask
+// TMC2209
+#define stepPin 2            // Step pin
+#define dirPin 4             // Direction pin
+#define enablePin 15         // Enable pin
+#define R_SENSE 0.11f        // Sense resistor value
+#define SERIAL_PORT Serial2  // UART communication
+#define DRIVER_ADDRESS 0b00
+
+// Pin definitions for the rotary encoder
+#define encoderAPin 32  // Change to your actual pin for A
+#define encoderBPin 35  // Change to your actual pin for B
+#define buttonPin 34    // Encoder Button pin
+
+// Fan and Led pins
+#define ledMotorPin 33
+#define fanPin 25
+
+// OLED Display Settings oled is spi
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// Function declarations
 void motorTask(void *parameter);
 void displayTask(void *parameter);
 void disableMotor();
-void cleanup();
 void enableMotor(int);
 void handleEncoder();
 void displayMessage(const char *title, const char *subtitle);
 void runMotorTask();
 void stopMotor();
-void setupMotor(int microstepsSetting, int maxSpeedSetting, int distance);
+void setupMotor(int microstepsSetting, int maxSpeedSetting, int distance, int noCycles);
 void processMotorPosition();
 void displayProgressBar(int progress);
-int calculateMotorTime(int steps_per_revolution, int speed, int distance, int acceleration);
-
-// Pin definitions for ESP32 and TMC2209
-#define stepPin 27           // Step pin
-#define dirPin 26            // Direction pin
-#define enablePin 25         // Enable pin
-#define R_SENSE 0.11f        // Sense resistor value
-#define SERIAL_PORT Serial2  // UART communication
-
-// Pin definitions for the rotary encoder
-#define encoderAPin 34  // Change to your actual pin for A
-#define encoderBPin 35  // Change to your actual pin for B
-#define buttonPin 32    // Encoder Button pin
-
-#define DRIVER_ADDRESS 0b00  // For standalone configuration
-const long SERIAL_BAUD_RATE = 115200;
+int calculateMotorTime(int steps_per_revolution, int speed, int distance, int acceleration, int cycles);
+void setupSpeeds();
 
 TMC2209Stepper driver(&SERIAL_PORT, R_SENSE, DRIVER_ADDRESS);
 
-// Create AccelStepper object
 AccelStepper stepper(AccelStepper::DRIVER, stepPin, dirPin);
 
-//HardwareSerial SERIAL_PORT(2);
-
-// OLED Display Settings
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-// hello 123
+
+Bounce debouncedButton = Bounce();
+Bounce debouncedEncoderA = Bounce();
+Bounce debouncedEncoderB = Bounce();
+
 // Global variables
 static bool motorEnabled = false;
 int countdownValue = 0;        // Global countdown value
@@ -70,30 +76,28 @@ int targetPosition = 2000;      // Forward target position
 int repeatCount = 5;            // Number of times to repeat forward and backward motion
 int currentIteration = 0;       // Track how many times the motion has repeated
 bool motorTaskUpdated = false;  // Flag to indicate if the motor task needs to update
-
-int *positions = nullptr;  // Array of target positions
+std::vector<int> positions;
 int currentPosIndex = 0;   // Track the current position index
 int numPositions = 0;      // Number of positions
 
 bool eStop = false;
-
+bool setupMode = false;
 int maxSpeed;
 int microsteps;
 
-int hello;
+bool otaMode = false;
 
+const char *ssid = "";
+const char *password = "";
 
-
-
-Bounce debouncedButton = Bounce();
-Bounce debouncedEncoderA = Bounce();
-Bounce debouncedEncoderB = Bounce();
+bool countdownStarted = false;
+unsigned long countdownStartTime = 0;
+Preferences preferences;
 
 void setup() {
     Serial.begin(115200);
     SERIAL_PORT.begin(115200, SERIAL_8N1, 16, 17);
-    //TMC2209Stepper driver(&SERIAL_PORT, R_SENSE, DRIVER_ADDRESS);
-
+    preferences.begin("watchclean", false);
     // Check communication with TMC2209 by reading a register
     uint32_t drv_status = driver.DRV_STATUS();
 
@@ -103,7 +107,7 @@ void setup() {
 
     uint8_t microsteps = driver.microsteps();
     Serial.print("Microstepping set to: ");
-    Serial.println(microsteps);  // Should print 16
+    Serial.println(microsteps);
 
     // Check if the communication response is valid
     if (drv_status == 0xFFFFFFFF) {
@@ -144,6 +148,9 @@ void setup() {
 
     // Enable the driver
     pinMode(enablePin, OUTPUT);
+    pinMode(ledMotorPin, OUTPUT);
+    pinMode(fanPin, OUTPUT);
+
     digitalWrite(enablePin, HIGH);  // Disable the motor
 
     // Initialize OLED display
@@ -164,7 +171,7 @@ void setup() {
 
     display.setFont();  // Set the desired font
     display.setCursor(55, 50);
-    display.print("Cleaner V1.0");
+    display.print("Cleaner V1.1");
     display.display();
     // Start the motor control task on Core 0
     xTaskCreatePinnedToCore(
@@ -193,21 +200,43 @@ void motorTask(void *parameter) {
     // FreeRTOS Task loop for motor control
     disableCore0WDT();
     for (;;) {
-        for (;;) {
-            if (stepper.distanceToGo() == 0) {
-                if (motorEnabled) {
-                    processMotorPosition();
-                }
-            } else {
-                runMotorTask();
+        if (stepper.distanceToGo() == 0) {
+            if (motorEnabled) {
+                processMotorPosition();
             }
+        } else {
+            runMotorTask();
+        }
+
+        if (countdownStarted) {
+            // Check if 10 seconds have passed
+            if (millis() - countdownStartTime >= 800000) {
+                // Trigger the action after countdown ends
+                digitalWrite(fanPin, LOW);
+                // Reset countdown
+                countdownStarted = false;
+            }
+        }
+
+        if (!motorEnabled && otaMode) {
+            //Serial.println("OTA Mode");
+
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(10, 20);
+            display.print("OTA Mode");
+            display.display();
+
+            ArduinoOTA.handle();
+            digitalWrite(ledMotorPin, HIGH);
         }
     }
 }
 
 void displayTask(void *parameter) {
     for (;;) {
-        if (motorEnabled && !eStop) {
+        if (motorEnabled && !eStop && !otaMode) {
             if (countdownActive) {
                 display.clearDisplay();
 
@@ -215,7 +244,7 @@ void displayTask(void *parameter) {
                 display.setTextColor(SSD1306_WHITE);
                 display.setCursor(10, 0);
 
-                const char *menuOptions[] = {"Cleaning Cycle", "Quick Dry", "Quick Clean", "Drying Cycle"};
+                const char *menuOptions[] = {"Cleaning Cycle", "Quick Dry", "Drying Cycle", "Setup", "OTA Update"};
                 display.print(menuOptions[selectedOption]);
 
                 // Display RPM
@@ -228,17 +257,16 @@ void displayTask(void *parameter) {
                 int stepsNow = microsteps * 200;
                 float rpm = (fabs(currentSpeed) * 60.0) / stepsNow;
 
-                display.setCursor(0, 20);
+                display.setCursor(10, 20);
                 display.print("RPM: ");
                 display.print(rpm);
-                display.setCursor(0, 30);
-                display.print("Microsteps: ");
+                display.setCursor(10, 30);
+                display.print("SPR: ");
                 display.print(stepsNow);
-                display.setCursor(0, 40);
+                display.setCursor(10, 40);
                 display.print("Power: ");
-                display.print(driver.cs_actual());
-                Serial.print(driver.cs2rms(driver.cs_actual()),DEC);
-                Serial.println(" MA MOTOR CURRENT"); 
+                display.print(driver.cs2rms(driver.cs_actual()), DEC);
+                display.print(" mA");
 
                 // Spinning circle animation
                 int radius = 10;
@@ -255,22 +283,25 @@ void displayTask(void *parameter) {
             }
             vTaskDelay(50 / portTICK_PERIOD_MS);
         } else if (eStop) {
-                display.clearDisplay();
-                display.setTextSize(1);
-                display.setTextColor(SSD1306_WHITE);
-                display.setCursor(0, 10);
-                display.print("Gental stop if i'm");
-                display.setCursor(0, 20);
-                display.print("exploding try");
-                display.setCursor(0, 30);
-                display.print("pulling out the plug!");
-              
-                display.display();
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 10);
+            display.print("Gental stop if i'm");
+            display.setCursor(0, 20);
+            display.print("exploding try");
+            display.setCursor(0, 30);
+            display.print("pulling out the plug!");
 
+            display.display();
 
-        } else { 
+        } else if (setupMode){
             animationStep = 0;
-            handleEncoder();
+            setupSpeeds();
+            
+        } else {
+            animationStep = 0;
+            handleEncoder(); 
         }
         taskYIELD();
         vTaskDelay(5 / portTICK_PERIOD_MS);
@@ -287,7 +318,9 @@ void displayProgressBar(int progress) {
     // Draw the border of the progress bar
     display.drawRect(barX, barY, barWidth, barHeight, SSD1306_WHITE);
 
-    int totalTimeLeft = (totalTimeProg * 4) * 10;
+    
+    
+    int totalTimeLeft = (totalTimeProg * 20);
     Serial.println(totalTimeLeft);
 
     // Calculate the fill width based on the progress percentage
@@ -314,11 +347,11 @@ void processMotorPosition() {
 
 void stopMotor() {
     vTaskDelay(20 / portTICK_PERIOD_MS);
-eStop = false;
+    eStop = false;
     disableMotor();
-    motorEnabled = false; 
+    motorEnabled = false;
     currentPosIndex = 0;
-    cleanup();
+
 }
 
 void runMotorTask() {
@@ -340,27 +373,40 @@ void handleEncoder() {
     debouncedEncoderA.update();
     debouncedEncoderB.update();
     debouncedButton.update();
-    // Check if the encoder has changed
-
-    //uint8_t microsteps = 0;
-    //int maxSpeed = 0;
 
     if (debouncedButton.fell()) {
         switch (selectedOption) {
             case 0:  // Cleaning Cycle full 3 mins
-                setupMotor(8, 8000, 188000);
+                setupMotor(2, 2000, 12000, 12);
                 break;
 
             case 1:  // Quick Dry 30 seconds
-                setupMotor(2, 7500, 88000);
+                setupMotor(2, 4500, 24000, 3);
                 break;
 
-            case 2:  // Quick Clean
-                setupMotor(2, 4000, 68000);
+            case 2:  // Drying cycle
+                setupMotor(2, 6000, 28000, 6);
                 break;
 
-            case 3:  // Drying cycle
-                setupMotor(2, 4000, 8000);
+            case 3:  // Setup Mode not implimented
+                setupMode = true;
+                
+                break;
+
+            case 4:  // Handle OTA Updates
+
+                WiFi.begin(ssid, password);
+                while (WiFi.status() != WL_CONNECTED) {
+                    delay(1000);
+                    Serial.println("Connecting to WiFi...");
+                }
+
+                Serial.println("Connected to WiFi");
+                otaMode = true;
+
+                ArduinoOTA.begin();
+                Serial.println("OTA ready");
+
                 break;
 
             default:
@@ -377,16 +423,11 @@ void handleEncoder() {
             encoderValue--;  // Counterclockwise rotation
                              //Serial.println("Counterclockwise rotation");
         }
-        // Update menu option based on encoder value
-
-        // Debug print for encoder value
-        //Serial.print("Encoder Value: ");
-        //Serial.println(encoderValue);
 
         // Update menu option based on encoder value
-        selectedOption = encoderValue % 4;  // Ensure the range is between 0 and 3
+        selectedOption = encoderValue % 5;  // Ensure the range is between 0 and 3
         if (selectedOption < 0) {
-            selectedOption += 4;  // Correct for negative values
+            selectedOption += 5;  // Correct for negative values
         }
         Serial.println(selectedOption);
         // Clear the display
@@ -395,14 +436,14 @@ void handleEncoder() {
         display.setTextColor(SSD1306_WHITE);
 
         // Menu options
-        const char *menuOptions[] = {"Cleaning Cycle", "Quick Dry", "Quick Clean", "Drying Cycle"};
+        const char *menuOptions[] = {"Cleaning Cycle", "Quick Dry", "Drying Cycle", "Setup", "OTA Update"};
 
         // Display all menu options and highlight the selected one
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             if (i == selectedOption) {
                 display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Highlight the selected option
                 display.setCursor(10, i * 13);                       // Adjust cursor position for each option
-                display.print("* ");                                 // Print asterisk for the selected option
+                display.print("* ");                                 
             } else {
                 display.setTextColor(SSD1306_WHITE);  // Normal text for other options
                 display.setCursor(10, i * 13);        // Adjust cursor position for each option
@@ -416,30 +457,57 @@ void handleEncoder() {
     }
 }
 
-void setupMotor(int microstepsSetting, int maxSpeedSetting, int distance) {
+
+void setupSpeeds() {
+
+
+ 
+        // Clear the display
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(10, 10); 
+        display.print("This does nothing yet!");
+        
+        
+
+        // Display everything on the screen
+        display.display();
+    }
+
+void setupMotor(int microstepsSetting, int maxSpeedSetting, int distance, int noCycles) {
     driver.microsteps(microstepsSetting);
     stepper.setMaxSpeed(maxSpeedSetting);
     stepper.setCurrentPosition(0);
     totalTimeProg = 0;
+    positions.resize(noCycles * 2);
 
     // Define positions array for each movement
-    numPositions = 3;
-    positions = new int[numPositions];  // Ensure old memory is freed if dynamic
-    positions[0] = 0;
-    positions[1] = distance;
-    positions[2] = 0;
+    numPositions = noCycles;
+    
+    for (int i = 0; i < noCycles * 2; ++i) {
+        positions[i] = (i % 2 == 0) ? distance : 0;
+    }
 
     maxSpeed = stepper.maxSpeed();
     microsteps = driver.microsteps() * 200;
-
-    totalTimeProg = calculateMotorTime(microstepsSetting, maxSpeedSetting, distance, 2000);
+    
+    
+    totalTimeProg = calculateMotorTime(microstepsSetting, maxSpeedSetting, distance, 2000, noCycles);
 
     stepper.moveTo(distance);
     Serial.println(motorEnabled);
 }
 
 void enableMotor(int countdownTime) {
-    digitalWrite(enablePin, LOW);  // Enable the motor
+    digitalWrite(enablePin, LOW);     // Enable the motor
+    digitalWrite(ledMotorPin, HIGH);  // Motor enabled led
+
+    if (selectedOption == 2 && !countdownStarted) {
+        digitalWrite(fanPin, HIGH);
+        countdownStartTime = millis();
+        countdownStarted = true;
+    }
     Serial.println("Motor enabled");
 
     // Set countdown and activate the countdown flag
@@ -450,7 +518,9 @@ void enableMotor(int countdownTime) {
 void disableMotor() {
     delay(100);
     countdownActive = false;
-    digitalWrite(enablePin, HIGH);  // Disable the motor
+    digitalWrite(enablePin, HIGH);   // Disable the motor
+    digitalWrite(ledMotorPin, LOW);  // Motor enabled led
+
     //Serial.println("Motor disabled");
 
     switch (selectedOption) {
@@ -479,6 +549,7 @@ void disableMotor() {
 void displayMessage(const char *title, const char *subtitle) {
     display.clearDisplay();
     delay(50);
+    display.clearDisplay();
     display.setFont(&PlaywriteGBS_VariableFont_wght9pt7b);  // Set the desired font
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -488,41 +559,37 @@ void displayMessage(const char *title, const char *subtitle) {
     display.print(subtitle);
     display.setFont();  // Reset to default font
     display.setCursor(55, 50);
-    display.print("Cleaner V1.0");
+    display.print("Cleaner V1.1");
     display.display();
 }
 
-int calculateMotorTime(int steps_per_revolution, int speed, int distance, int acceleration) {
-    // Step 1: Calculate time to reach maximum speed
-    float t_acc = static_cast<float>(speed) / acceleration;  // Time to reach max speed
+int calculateMotorTime(int steps_per_revolution, int speed, int distance, int acceleration, int cycles) {
 
-    // Step 2: Calculate distance covered during acceleration
-    float d_acc = 0.5f * acceleration * (t_acc * t_acc);
 
-    // Step 3: Check if the distance can be completed within the acceleration phase
-    float t_total;  // Total time
-    if (distance <= d_acc) {
-        // If the total distance is less than the distance covered during acceleration
-        t_total = sqrt(2.0f * distance / acceleration);
+
+
+    double t = 0;
+
+    // Check if the max acceleration phase can be fully used
+    if ((speed * speed / acceleration) > distance) {
+        // Truncated pyramid
+        // First the sloping ends (acceleration and deceleration phases)
+        t = 2.0 * speed / acceleration;  // Time for accel and decel phases
+        distance -= (speed * speed / acceleration); // Subtract the distance covered during acceleration and deceleration
+
+        // Then the rectangular center (constant speed phase)
+        t += (distance / speed); // Time at constant speed
     } else {
-        // If the distance exceeds the distance covered during acceleration
-        // Calculate the constant speed distance
-        float d_const = distance - 2 * d_acc;
-        float t_const = d_const / speed;
-        // Total time
-        t_total = t_acc + t_const + t_acc;
+        // Triangle (only acceleration and deceleration, no constant speed)
+        t = std::sqrt(static_cast<double>(distance) / acceleration); // Time for acceleration and deceleration
     }
 
-    // Return the total time as an integer (in seconds)
-    return static_cast<int>(t_total);
+        return static_cast<int>(std::round(t * cycles));
+
+
+
 }
 
-void cleanup() {
-    delete[] positions;   // Free allocated memory
-    positions = nullptr;  // Prevent dangling pointer
-}
 
 void loop() {
 }
-
-
